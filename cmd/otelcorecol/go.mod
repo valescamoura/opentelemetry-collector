@@ -16,6 +16,7 @@ require (
 	go.opentelemetry.io/collector/connector/forwardconnector v0.154.0
 	go.opentelemetry.io/collector/exporter v1.60.0
 	go.opentelemetry.io/collector/exporter/debugexporter v0.154.0
+	go.opentelemetry.io/collector/exporter/flowceptacademyexporter v0.154.0
 	go.opentelemetry.io/collector/exporter/nopexporter v0.154.0
 	go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0
 	go.opentelemetry.io/collector/exporter/otlphttpexporter v0.154.0
@@ -39,6 +40,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/foxboron/go-tpm-keyfiles v0.0.0-20251226215517-609e4778396f // indirect
@@ -74,6 +76,7 @@ require (
 	github.com/prometheus/common v0.68.1 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
+	github.com/redis/go-redis/v9 v9.17.2 // indirect
 	github.com/rs/cors v1.11.1 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.5 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
@@ -81,6 +84,8 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector v0.154.0 // indirect
@@ -250,6 +255,8 @@ replace go.opentelemetry.io/collector/exporter/xexporter => ../../exporter/xexpo
 replace go.opentelemetry.io/collector/exporter/exporterhelper => ../../exporter/exporterhelper
 
 replace go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper => ../../exporter/exporterhelper/xexporterhelper
+
+replace go.opentelemetry.io/collector/exporter/flowceptacademyexporter => ../../exporter/flowceptacademyexporter
 
 replace go.opentelemetry.io/collector/exporter/nopexporter => ../../exporter/nopexporter
 

@@ -17,6 +17,7 @@ receivers:
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.154.0
+  - gomod: go.opentelemetry.io/collector/exporter/flowceptacademyexporter v0.154.0
   - gomod: go.opentelemetry.io/collector/exporter/nopexporter v0.154.0
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0
   - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.154.0
@@ -79,6 +80,7 @@ replaces:
   - go.opentelemetry.io/collector/exporter/xexporter => ../../exporter/xexporter
   - go.opentelemetry.io/collector/exporter/exporterhelper => ../../exporter/exporterhelper
   - go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper => ../../exporter/exporterhelper/xexporterhelper
+  - go.opentelemetry.io/collector/exporter/flowceptacademyexporter => ../../exporter/flowceptacademyexporter
   - go.opentelemetry.io/collector/exporter/nopexporter => ../../exporter/nopexporter
   - go.opentelemetry.io/collector/exporter/otlpexporter => ../../exporter/otlpexporter
   - go.opentelemetry.io/collector/exporter/otlphttpexporter => ../../exporter/otlphttpexporter
