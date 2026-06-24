@@ -68,6 +68,7 @@ type flowceptExporter struct {
 
 	mu                 sync.Mutex
 	publishedWorkflows map[string]struct{}
+	publishedAgents    map[string]struct{}
 }
 
 func newFlowceptExporter(cfg Config, publisher publisher) *flowceptExporter {
@@ -75,6 +76,7 @@ func newFlowceptExporter(cfg Config, publisher publisher) *flowceptExporter {
 		cfg:                cfg.normalized(),
 		publisher:          publisher,
 		publishedWorkflows: make(map[string]struct{}),
+		publishedAgents:    make(map[string]struct{}),
 	}
 }
 
@@ -87,13 +89,28 @@ type spanRecord struct {
 type traceMapping struct {
 	workflowID   string
 	workflowName string
-	chainSpan    ptrace.Span
-	hasChain     bool
+	rootChain    ptrace.Span
+	hasRootChain bool
+	childChains  []chainContext
 }
 
 type agentInfo struct {
-	ID   string
-	Name string
+	ID         string
+	Name       string
+	WorkflowID string
+	CampaignID string
+}
+
+type chainContext struct {
+	SpanID       string
+	ParentSpanID string
+	Name         string
+	ActivityID   string
+	StartedAt    float64
+	EndedAt      float64
+	Used         map[string]any
+	Generated    map[string]any
+	Metadata     any
 }
 
 func (e *flowceptExporter) pushTraces(ctx context.Context, td ptrace.Traces) error {
@@ -124,11 +141,14 @@ func (e *flowceptExporter) pushTraces(ctx context.Context, td ptrace.Traces) err
 				attrs := span.Attributes().AsRaw()
 				spanKind := stringAttr(attrs, "openinference.span.kind")
 				spanKinds[span.SpanID().String()] = spanKind
-				if spanKind == "CHAIN" && !traces[traceID].hasChain {
-					traces[traceID].workflowID = span.SpanID().String()
-					traces[traceID].workflowName = span.Name()
-					traces[traceID].chainSpan = span
-					traces[traceID].hasChain = true
+				if spanKind == "CHAIN" {
+					if span.ParentSpanID().String() == "" && !traces[traceID].hasRootChain {
+						traces[traceID].workflowName = span.Name()
+						traces[traceID].rootChain = span
+						traces[traceID].hasRootChain = true
+					} else {
+						traces[traceID].childChains = append(traces[traceID].childChains, chainContextForSpan(span))
+					}
 				}
 				if spanKind == "AGENT" {
 					agent := agentInfo{
@@ -146,8 +166,8 @@ func (e *flowceptExporter) pushTraces(ctx context.Context, td ptrace.Traces) err
 
 	if !e.cfg.DisableWorkflowObjects {
 		for traceID, mapping := range traces {
-			if mapping.hasChain {
-				if err := e.publishWorkflow(ctx, mapping.chainSpan, mapping.workflowID); err != nil {
+			if mapping.hasRootChain {
+				if err := e.publishWorkflow(ctx, mapping.rootChain, mapping.workflowID, mapping.workflowName, mapping.childChains); err != nil {
 					return err
 				}
 			} else {
@@ -160,6 +180,27 @@ func (e *flowceptExporter) pushTraces(ctx context.Context, td ptrace.Traces) err
 
 	for _, record := range records {
 		attrs := record.span.Attributes().AsRaw()
+		if stringAttr(attrs, "openinference.span.kind") != "AGENT" {
+			continue
+		}
+		workflowID := record.span.TraceID().String()
+		if mapping, ok := traces[workflowID]; ok {
+			workflowID = mapping.workflowID
+		}
+		agent := agentInfo{
+			ID:         cleanAcademyID(stringAttr(attrs, "academy.agent.id")),
+			Name:       stringAttr(attrs, "agent.name"),
+			WorkflowID: workflowID,
+			CampaignID: e.campaignID(attrs, record.resourceAttrs),
+		}
+		if err := e.publishAgent(ctx, agent); err != nil {
+			return err
+		}
+	}
+
+	chainContextUseCount := make(map[string]int)
+	for _, record := range records {
+		attrs := record.span.Attributes().AsRaw()
 		if stringAttr(attrs, "openinference.span.kind") != "TOOL" {
 			continue
 		}
@@ -169,7 +210,13 @@ func (e *flowceptExporter) pushTraces(ctx context.Context, td ptrace.Traces) err
 			workflowID = mapping.workflowID
 			workflowName = mapping.workflowName
 		}
-		if err := e.publishObject(ctx, e.spanToTask(record.span, record.resourceAttrs, record.scopeName, workflowID, workflowName, spanKinds, agentsBySpanID, agentsByAgentID)); err != nil {
+		var chainContext *chainContext
+		if mapping, ok := traces[record.span.TraceID().String()]; ok {
+			activityID := activityIDForSpan(record.span, attrs)
+			chainContext = matchingChainContext(mapping.childChains, activityID, chainContextUseCount[activityID])
+			chainContextUseCount[activityID]++
+		}
+		if err := e.publishObject(ctx, e.spanToTask(record.span, record.resourceAttrs, record.scopeName, workflowID, workflowName, spanKinds, agentsBySpanID, agentsByAgentID, chainContext)); err != nil {
 			return err
 		}
 	}
@@ -183,18 +230,21 @@ func (e *flowceptExporter) shutdown(context.Context) error {
 	return e.publisher.Close()
 }
 
-func (e *flowceptExporter) publishWorkflow(ctx context.Context, span ptrace.Span, workflowID string) error {
+func (e *flowceptExporter) publishWorkflow(ctx context.Context, span ptrace.Span, workflowID string, workflowName string, childChains []chainContext) error {
 	if e.workflowAlreadyPublished(workflowID) {
 		return nil
 	}
 
 	attrs := span.Attributes().AsRaw()
+	if workflowName == "" {
+		workflowName = span.Name()
+	}
 	safeAttrs := sanitizeMongoKeys(normalizeAcademyIDs(attrs))
 	resourceAttrs := map[string]any{}
 	workflow := map[string]any{
 		"type":          "workflow",
 		"workflow_id":   workflowID,
-		"name":          span.Name(),
+		"name":          workflowName,
 		"adapter_id":    e.cfg.AdapterID,
 		"subtype":       "academy.workflow",
 		"utc_timestamp": nowUnixSeconds(),
@@ -220,6 +270,9 @@ func (e *flowceptExporter) publishWorkflow(ctx context.Context, span ptrace.Span
 	}
 	if generated, ok := flowceptIO(attrs, "output.value"); ok {
 		workflow["generated"] = generated
+	}
+	if len(childChains) > 0 {
+		workflow["custom_metadata"].(map[string]any)["openinference_child_chains"] = chainContextsAsMetadata(childChains)
 	}
 	addParsedMetadata(workflow["custom_metadata"].(map[string]any), attrs)
 	return e.publishObject(ctx, workflow)
@@ -262,6 +315,7 @@ func (e *flowceptExporter) spanToTask(
 	spanKinds map[string]string,
 	agentsBySpanID map[string]agentInfo,
 	agentsByAgentID map[string]agentInfo,
+	chainContext *chainContext,
 ) map[string]any {
 	attrs := span.Attributes().AsRaw()
 	safeAttrs := sanitizeMongoKeys(normalizeAcademyIDs(attrs))
@@ -273,7 +327,7 @@ func (e *flowceptExporter) spanToTask(
 		"workflow_id":   workflowID,
 		"activity_id":   activityIDForSpan(span, attrs),
 		"adapter_id":    e.cfg.AdapterID,
-		"subtype":       "academy.action",
+		"subtype":       subtypeForSpan(span, attrs),
 		"utc_timestamp": nowUnixSeconds(),
 		"started_at":    unixSeconds(span.StartTimestamp()),
 		"ended_at":      unixSeconds(span.EndTimestamp()),
@@ -343,8 +397,112 @@ func (e *flowceptExporter) spanToTask(
 		moveTelemetryRuntime(task["custom_metadata"].(map[string]any), telemetry, "telemetry_runtime_at_end")
 		task["telemetry_at_end"] = telemetry
 	}
+	if chainContext != nil {
+		task["custom_metadata"].(map[string]any)["openinference_chain_context"] = chainContext.asMetadata()
+	}
 	addParsedMetadata(task["custom_metadata"].(map[string]any), attrs)
 	return task
+}
+
+func chainContextForSpan(span ptrace.Span) chainContext {
+	attrs := span.Attributes().AsRaw()
+	context := chainContext{
+		SpanID:       span.SpanID().String(),
+		ParentSpanID: span.ParentSpanID().String(),
+		Name:         span.Name(),
+		ActivityID:   activityIDForSpan(span, attrs),
+		StartedAt:    unixSeconds(span.StartTimestamp()),
+		EndedAt:      unixSeconds(span.EndTimestamp()),
+	}
+	if used, ok := flowceptIO(attrs, "input.value"); ok {
+		context.Used = used
+	}
+	if generated, ok := flowceptIO(attrs, "output.value"); ok {
+		context.Generated = generated
+	}
+	metadata := stringAttr(attrs, "metadata")
+	if metadata != "" {
+		var parsed any
+		if err := json.Unmarshal([]byte(metadata), &parsed); err == nil {
+			context.Metadata = sanitizeMongoKeys(normalizeAcademyIDs(parsed))
+		}
+	}
+	return context
+}
+
+func (c chainContext) asMetadata() map[string]any {
+	out := map[string]any{
+		"span_id":        c.SpanID,
+		"parent_span_id": c.ParentSpanID,
+		"name":           c.Name,
+		"activity_id":    c.ActivityID,
+		"started_at":     c.StartedAt,
+		"ended_at":       c.EndedAt,
+	}
+	if c.Used != nil {
+		out["used"] = c.Used
+	}
+	if c.Generated != nil {
+		out["generated"] = c.Generated
+	}
+	if c.Metadata != nil {
+		out["metadata"] = c.Metadata
+	}
+	return out
+}
+
+func chainContextsAsMetadata(contexts []chainContext) []any {
+	out := make([]any, 0, len(contexts))
+	for _, context := range contexts {
+		out = append(out, context.asMetadata())
+	}
+	return out
+}
+
+func matchingChainContext(contexts []chainContext, activityID string, occurrence int) *chainContext {
+	seen := 0
+	for i := range contexts {
+		if contexts[i].ActivityID == activityID {
+			if seen == occurrence {
+				return &contexts[i]
+			}
+			seen++
+		}
+	}
+	return nil
+}
+
+func (e *flowceptExporter) publishAgent(ctx context.Context, agent agentInfo) error {
+	if agent.ID == "" || e.agentAlreadyPublished(agent.ID) {
+		return nil
+	}
+	object := map[string]any{
+		"type":        "agent",
+		"agent_id":    agent.ID,
+		"name":        agent.Name,
+		"workflow_id": agent.WorkflowID,
+		"adapter_id":  e.cfg.AdapterID,
+		"custom_metadata": map[string]any{
+			"source": "opentelemetry",
+			"openinference": map[string]any{
+				"span_kind": "AGENT",
+			},
+		},
+	}
+	if agent.CampaignID != "" {
+		object["campaign_id"] = agent.CampaignID
+	}
+	return e.publishObject(ctx, object)
+}
+
+func (e *flowceptExporter) agentAlreadyPublished(agentID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.publishedAgents[agentID]; ok {
+		return true
+	}
+	e.publishedAgents[agentID] = struct{}{}
+	return false
 }
 
 func moveTelemetryRuntime(customMetadata map[string]any, telemetry map[string]any, key string) {
@@ -397,12 +555,37 @@ func activityIDForSpan(span ptrace.Span, attrs map[string]any) string {
 		if toolName := stringAttr(attrs, "tool.name"); toolName != "" {
 			return toolName
 		}
+	case "CHAIN":
+		if workflowName := academyMetadataName(attrs, "workflow"); workflowName != "" {
+			return workflowName
+		}
 	case "AGENT":
 		if agentName := stringAttr(attrs, "agent.name"); agentName != "" {
 			return agentName
 		}
 	}
 	return span.Name()
+}
+
+func academyMetadataName(attrs map[string]any, kind string) string {
+	metadata := stringAttr(attrs, "metadata")
+	if metadata == "" {
+		return ""
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(metadata), &parsed); err != nil {
+		return ""
+	}
+	academy, ok := parsed["academy"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	entry, ok := academy[kind].(map[string]any)
+	if !ok {
+		return ""
+	}
+	name, _ := entry["name"].(string)
+	return name
 }
 
 func eventsAsRaw(events ptrace.SpanEventSlice) []any {
@@ -554,8 +737,11 @@ func (e *flowceptExporter) publishObject(ctx context.Context, object map[string]
 }
 
 func subtypeForSpan(span ptrace.Span, attrs map[string]any) string {
-	if kind := stringAttr(attrs, "openinference.span.kind"); kind != "" {
-		return kind
+	switch stringAttr(attrs, "openinference.span.kind") {
+	case "TOOL":
+		return "academy_action"
+	case "AGENT", "CHAIN":
+		return "academy_lifecycle"
 	}
 	switch span.Kind() {
 	case ptrace.SpanKindProducer:

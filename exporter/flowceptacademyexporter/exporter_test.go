@@ -107,13 +107,13 @@ func TestPushTracesPublishesWorkflowAndToolTask(t *testing.T) {
 	telemetryEnd.Attributes().PutStr("flowcept.telemetry", `{"process":{"pid":101,"memory":{"rss":4096}},"cpu":{"percent_all":15.5},"runtime":{"language":"python"}}`)
 
 	require.NoError(t, exp.pushTraces(context.Background(), td))
-	require.Len(t, publisher.messages, 2)
-	require.Equal(t, []string{"interception", "interception"}, publisher.channels)
+	require.Len(t, publisher.messages, 3)
+	require.Equal(t, []string{"interception", "interception", "interception"}, publisher.channels)
 
 	var workflow map[string]any
 	require.NoError(t, msgpack.Unmarshal(publisher.messages[0], &workflow))
 	require.Equal(t, "workflow", workflow["type"])
-	require.Equal(t, chainID.String(), workflow["workflow_id"])
+	require.Equal(t, traceID.String(), workflow["workflow_id"])
 	require.Equal(t, "academy.workflow", workflow["name"])
 	require.Equal(t, "academy.workflow", workflow["subtype"])
 	require.IsType(t, float64(0), workflow["utc_timestamp"])
@@ -121,13 +121,21 @@ func TestPushTracesPublishesWorkflowAndToolTask(t *testing.T) {
 	require.Equal(t, "test-adapter", workflow["adapter_id"])
 	require.Equal(t, "campaign-1", workflow["campaign_id"])
 
+	var agentObject map[string]any
+	require.NoError(t, msgpack.Unmarshal(publisher.messages[1], &agentObject))
+	require.Equal(t, "agent", agentObject["type"])
+	require.Equal(t, "abc", agentObject["agent_id"])
+	require.Equal(t, "TextAgent", agentObject["name"])
+	require.Equal(t, traceID.String(), agentObject["workflow_id"])
+	require.Equal(t, "campaign-1", agentObject["campaign_id"])
+
 	var task map[string]any
-	require.NoError(t, msgpack.Unmarshal(publisher.messages[1], &task))
+	require.NoError(t, msgpack.Unmarshal(publisher.messages[2], &task))
 	require.Equal(t, "task", task["type"])
-	require.Equal(t, chainID.String(), task["workflow_id"])
+	require.Equal(t, traceID.String(), task["workflow_id"])
 	require.NotContains(t, task, "parent_task_id")
 	require.Equal(t, "uppercase", task["activity_id"])
-	require.Equal(t, "academy.action", task["subtype"])
+	require.Equal(t, "academy_action", task["subtype"])
 	require.IsType(t, float64(0), task["utc_timestamp"])
 	require.Greater(t, task["utc_timestamp"].(float64), float64(0))
 	require.Equal(t, "academy.workflow", task["workflow_name"])
@@ -188,6 +196,65 @@ func TestPushTracesPublishesOnlyOneWorkflowPerTrace(t *testing.T) {
 	require.Len(t, publisher.messages, 1)
 }
 
+func TestNonRootChainEnrichesTaskWithoutCreatingWorkflow(t *testing.T) {
+	publisher := &fakePublisher{}
+	exp := newFlowceptExporter(Config{}, publisher)
+
+	td := ptrace.NewTraces()
+	spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+
+	traceID := pcommon.TraceID([16]byte{1})
+	rootChainID := pcommon.SpanID([8]byte{2})
+	toolID := pcommon.SpanID([8]byte{3})
+	childChainID := pcommon.SpanID([8]byte{4})
+
+	root := spans.AppendEmpty()
+	root.SetTraceID(traceID)
+	root.SetSpanID(rootChainID)
+	root.SetName("academy.workflow.run_gridsearch")
+	root.Attributes().PutStr("openinference.span.kind", "CHAIN")
+	root.Attributes().PutStr("metadata", `{"academy":{"workflow":{"name":"run_gridsearch"}}}`)
+
+	child := spans.AppendEmpty()
+	child.SetTraceID(traceID)
+	child.SetSpanID(childChainID)
+	child.SetParentSpanID(toolID)
+	child.SetName("academy.workflow.train_config")
+	child.Attributes().PutStr("openinference.span.kind", "CHAIN")
+	child.Attributes().PutStr("metadata", `{"academy":{"workflow":{"name":"train_config"}}}`)
+	child.Attributes().PutStr("input.mime_type", "application/json")
+	child.Attributes().PutStr("input.value", `{"config_id":"cfg_1"}`)
+	child.Attributes().PutStr("output.mime_type", "application/json")
+	child.Attributes().PutStr("output.value", `{"val_loss":0.1}`)
+
+	tool := spans.AppendEmpty()
+	tool.SetTraceID(traceID)
+	tool.SetSpanID(toolID)
+	tool.SetParentSpanID(rootChainID)
+	tool.SetName("academy.runtime.action.train_config")
+	tool.Attributes().PutStr("openinference.span.kind", "TOOL")
+	tool.Attributes().PutStr("tool.name", "train_config")
+
+	require.NoError(t, exp.pushTraces(context.Background(), td))
+	require.Len(t, publisher.messages, 2)
+
+	var workflow map[string]any
+	require.NoError(t, msgpack.Unmarshal(publisher.messages[0], &workflow))
+	require.Equal(t, traceID.String(), workflow["workflow_id"])
+	workflowMetadata := workflow["custom_metadata"].(map[string]any)
+	childChains := workflowMetadata["openinference_child_chains"].([]any)
+	require.Len(t, childChains, 1)
+
+	var task map[string]any
+	require.NoError(t, msgpack.Unmarshal(publisher.messages[1], &task))
+	require.Equal(t, traceID.String(), task["workflow_id"])
+	taskMetadata := task["custom_metadata"].(map[string]any)
+	chainContext := taskMetadata["openinference_chain_context"].(map[string]any)
+	require.Equal(t, childChainID.String(), chainContext["span_id"])
+	require.Equal(t, "train_config", chainContext["activity_id"])
+	require.Equal(t, "academy.workflow.train_config", chainContext["name"])
+}
+
 func TestToolTaskUsesSourceAgentNameFromCallingAgent(t *testing.T) {
 	publisher := &fakePublisher{}
 	exp := newFlowceptExporter(Config{}, publisher)
@@ -236,10 +303,11 @@ func TestToolTaskUsesSourceAgentNameFromCallingAgent(t *testing.T) {
 	tool.Attributes().PutStr("academy.action.source_id", "AgentId<caller>")
 
 	require.NoError(t, exp.pushTraces(context.Background(), td))
-	require.Len(t, publisher.messages, 2)
+	require.Len(t, publisher.messages, 4)
 
 	var task map[string]any
-	require.NoError(t, msgpack.Unmarshal(publisher.messages[1], &task))
+	require.NoError(t, msgpack.Unmarshal(publisher.messages[3], &task))
+	require.Equal(t, traceID.String(), task["workflow_id"])
 	require.Equal(t, "worker", task["agent_id"])
 	require.Equal(t, "WorkerAgent", task["agent_name"])
 	require.Equal(t, "caller", task["source_agent_id"])
