@@ -176,6 +176,55 @@ func TestPushTracesPublishesWorkflowAndToolTask(t *testing.T) {
 	require.Equal(t, "python", runtimeAtStart["language"])
 }
 
+func TestPushTracesPublishesSameAgentIDForDifferentWorkflows(t *testing.T) {
+	publisher := &fakePublisher{}
+	exp := newFlowceptExporter(Config{}, publisher)
+
+	td := ptrace.NewTraces()
+	spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+
+	traceIDs := []pcommon.TraceID{
+		pcommon.TraceID([16]byte{1}),
+		pcommon.TraceID([16]byte{2}),
+	}
+	for i, traceID := range traceIDs {
+		chainID := pcommon.SpanID([8]byte{byte(10 + i)})
+		agentID := pcommon.SpanID([8]byte{byte(20 + i)})
+
+		chain := spans.AppendEmpty()
+		chain.SetTraceID(traceID)
+		chain.SetSpanID(chainID)
+		chain.SetName("academy.workflow")
+		chain.Attributes().PutStr("openinference.span.kind", "CHAIN")
+
+		agent := spans.AppendEmpty()
+		agent.SetTraceID(traceID)
+		agent.SetSpanID(agentID)
+		agent.SetParentSpanID(chainID)
+		agent.SetName("academy.agent.TextAgent")
+		agent.Attributes().PutStr("openinference.span.kind", "AGENT")
+		agent.Attributes().PutStr("agent.name", "TextAgent")
+		agent.Attributes().PutStr("academy.agent.id", "AgentId<abc>")
+	}
+
+	require.NoError(t, exp.pushTraces(context.Background(), td))
+
+	agentWorkflowIDs := make(map[string]bool)
+	for _, message := range publisher.messages {
+		var object map[string]any
+		require.NoError(t, msgpack.Unmarshal(message, &object))
+		if object["type"] == "agent" {
+			require.Equal(t, "abc", object["agent_id"])
+			agentWorkflowIDs[object["workflow_id"].(string)] = true
+		}
+	}
+
+	require.Equal(t, map[string]bool{
+		traceIDs[0].String(): true,
+		traceIDs[1].String(): true,
+	}, agentWorkflowIDs)
+}
+
 func TestPushTracesPublishesOnlyOneWorkflowPerTrace(t *testing.T) {
 	publisher := &fakePublisher{}
 	exp := newFlowceptExporter(Config{}, publisher)

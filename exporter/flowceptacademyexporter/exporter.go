@@ -473,7 +473,7 @@ func matchingChainContext(contexts []chainContext, activityID string, occurrence
 }
 
 func (e *flowceptExporter) publishAgent(ctx context.Context, agent agentInfo) error {
-	if agent.ID == "" || e.agentAlreadyPublished(agent.ID) {
+	if agent.ID == "" || e.agentAlreadyPublished(agent.WorkflowID, agent.ID) {
 		return nil
 	}
 	object := map[string]any{
@@ -495,13 +495,14 @@ func (e *flowceptExporter) publishAgent(ctx context.Context, agent agentInfo) er
 	return e.publishObject(ctx, object)
 }
 
-func (e *flowceptExporter) agentAlreadyPublished(agentID string) bool {
+func (e *flowceptExporter) agentAlreadyPublished(workflowID string, agentID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.publishedAgents[agentID]; ok {
+	key := workflowID + ":" + agentID
+	if _, ok := e.publishedAgents[key]; ok {
 		return true
 	}
-	e.publishedAgents[agentID] = struct{}{}
+	e.publishedAgents[key] = struct{}{}
 	return false
 }
 
