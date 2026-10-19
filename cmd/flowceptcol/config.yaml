@@ -1,0 +1,25 @@
+# Collector config for the workflow-gateway agent telemetry.
+# Run from the repository root:
+#   ./cmd/flowceptcol/flowceptcol --config cmd/flowceptcol/config.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  flowcept:
+    # JSONL in the Flowcept offline buffer format (Flowcept.read_buffer_file).
+    path: ${env:FLOWCEPT_OTEL_BUFFER_PATH:-flowcept_otel_buffer.jsonl}
+    # Workflow that groups all traces (chat turns) of one session: chat:<session.id>
+    workflow_id_prefix: "chat:"
+    adapter_id: otel_openinference
+    trace_timeout: 5m
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [flowcept]
