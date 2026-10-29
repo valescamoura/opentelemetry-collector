@@ -142,7 +142,7 @@ func TestChildrenAreHeldUntilRootAndInheritSession(t *testing.T) {
 	assert.Equal(t, "chat:sess-1", rootTask["workflow_id"])
 	assert.Equal(t, "sess-1", rootTask["campaign_id"])
 	assert.Equal(t, "agent", rootTask["subtype"])
-	assert.Equal(t, "OmniAgent", rootTask["agent_id"])
+	assert.Equal(t, "OmniAgent:sess-1", rootTask["agent_id"])
 	assert.Equal(t, "OmniAgent.run", rootTask["activity_id"])
 	assert.Equal(t, "FINISHED", rootTask["status"])
 	assert.Nil(t, rootTask["parent_task_id"])
@@ -170,6 +170,39 @@ func TestTracesOfSameSessionShareOneWorkflow(t *testing.T) {
 	tasks := tasksByID(records)
 	assert.Equal(t, "chat:sess-1", tasks[rootA.String()]["workflow_id"])
 	assert.Equal(t, "chat:sess-1", tasks[rootB.String()]["workflow_id"])
+}
+
+func TestAgentRecordIsWrittenOncePerSession(t *testing.T) {
+	exp, path := newTestExporter(t)
+	ctx := context.Background()
+	agentAttrs := func(session string) map[string]string {
+		return map[string]string{attrSessionID: session, attrAgentName: "OmniAgent", attrUserID: "valesca"}
+	}
+
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(testSpan{trace: traceA, id: rootA, name: "turn 1", attrs: agentAttrs("sess-1")})))
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(testSpan{trace: traceB, id: rootB, name: "turn 2", attrs: agentAttrs("sess-1")})))
+	traceC, rootC := pcommon.TraceID([16]byte{0xc}), pcommon.SpanID([8]byte{5})
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(testSpan{trace: traceC, id: rootC, name: "turn 1", attrs: agentAttrs("sess-2")})))
+	require.NoError(t, exp.shutdown(ctx))
+
+	records := readRecords(t, path)
+	var agents []map[string]any
+	for _, r := range records {
+		if r["type"] == "agent" {
+			agents = append(agents, r)
+		}
+	}
+	require.Len(t, agents, 2, "one agent record per (agent, session)")
+	assert.Equal(t, "OmniAgent:sess-1", agents[0]["agent_id"])
+	assert.Equal(t, "OmniAgent", agents[0]["name"])
+	assert.Equal(t, "sess-1", agents[0]["campaign_id"])
+	assert.Equal(t, "chat:sess-1", agents[0]["workflow_id"])
+	assert.Equal(t, "valesca", agents[0]["user"])
+	assert.Equal(t, "OmniAgent:sess-2", agents[1]["agent_id"])
+
+	tasks := tasksByID(records)
+	assert.Equal(t, "OmniAgent:sess-1", tasks[rootB.String()]["agent_id"])
+	assert.Equal(t, "OmniAgent:sess-2", tasks[rootC.String()]["agent_id"])
 }
 
 func TestLateSpanFollowsResolvedTrace(t *testing.T) {

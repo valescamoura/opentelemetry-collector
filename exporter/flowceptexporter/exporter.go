@@ -42,6 +42,7 @@ type flowceptExporter struct {
 	pending   map[string]*pendingTrace
 	resolved  map[string]resolvedTrace
 	workflows map[string]bool
+	agents    map[string]bool
 	file      *os.File
 
 	stop chan struct{}
@@ -56,6 +57,7 @@ func newFlowceptExporter(cfg *Config, logger *zap.Logger) *flowceptExporter {
 		pending:   map[string]*pendingTrace{},
 		resolved:  map[string]resolvedTrace{},
 		workflows: map[string]bool{},
+		agents:    map[string]bool{},
 	}
 }
 
@@ -105,7 +107,7 @@ func (e *flowceptExporter) pushTraces(_ context.Context, td ptrace.Traces) error
 			for k := 0; k < spans.Len(); k++ {
 				rec := newSpanRecord(spans.At(k), rs.Resource(), ss.Scope())
 				if done, ok := e.resolved[rec.traceID]; ok {
-					if err := e.writeLocked(taskRecord(rec, done.workflowID, done.campaignID, e.cfg.AdapterID, e.nowSeconds())); err != nil {
+					if err := e.writeTaskLocked(rec, done.workflowID, done.campaignID, e.nowSeconds()); err != nil {
 						return err
 					}
 					continue
@@ -150,12 +152,27 @@ func (e *flowceptExporter) flushTraceLocked(traceID string) error {
 		e.workflows[workflowID] = true
 	}
 	for _, rec := range p.spans {
-		if err := e.writeLocked(taskRecord(rec, workflowID, campaignID, e.cfg.AdapterID, now)); err != nil {
+		if err := e.writeTaskLocked(rec, workflowID, campaignID, now); err != nil {
 			return err
 		}
 	}
 	e.resolved[traceID] = resolvedTrace{workflowID: workflowID, campaignID: campaignID, resolvedAt: e.now()}
 	return nil
+}
+
+// writeTaskLocked writes the task of a span, preceded by the record of its
+// agent the first time the agent shows up. Callers hold e.mu.
+func (e *flowceptExporter) writeTaskLocked(rec spanRecord, workflowID, campaignID string, now float64) error {
+	if agentName := rec.stringAttr(attrAgentName); agentName != "" {
+		agentID := agentIDFor(agentName, campaignID)
+		if !e.agents[agentID] {
+			if err := e.writeLocked(agentRecord(rec, workflowID, campaignID, e.cfg.AdapterID)); err != nil {
+				return err
+			}
+			e.agents[agentID] = true
+		}
+	}
+	return e.writeLocked(taskRecord(rec, workflowID, campaignID, e.cfg.AdapterID, now))
 }
 
 func (e *flowceptExporter) writeLocked(record map[string]any) error {

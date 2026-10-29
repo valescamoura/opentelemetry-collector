@@ -141,7 +141,7 @@ func taskRecord(r spanRecord, workflowID, campaignID, adapterID string, now floa
 		task["subtype"] = strings.ToLower(kind)
 	}
 	if agent := r.stringAttr(attrAgentName); agent != "" {
-		task["agent_id"] = agent
+		task["agent_id"] = agentIDFor(agent, campaignID)
 	}
 	if user := r.stringAttr(attrUserID); user != "" {
 		task["user"] = user
@@ -185,4 +185,33 @@ func workflowRecord(workflowID, campaignID, adapterID string, now float64) map[s
 		"adapter_id":    adapterID,
 		"utc_timestamp": now,
 	}
+}
+
+// agentIDFor builds the Flowcept agent_id of an agent in a session. A Flowcept
+// agent record describes one agent execution, so each session gets its own.
+func agentIDFor(agentName, session string) string {
+	if session != "" {
+		return agentName + ":" + session
+	}
+	return agentName
+}
+
+// agentRecord builds the Flowcept agent record of an agent in a session.
+func agentRecord(r spanRecord, workflowID, campaignID, adapterID string) map[string]any {
+	agentName := r.stringAttr(attrAgentName)
+	agent := map[string]any{
+		"type":          "agent",
+		"agent_id":      agentIDFor(agentName, campaignID),
+		"name":          agentName,
+		"workflow_id":   workflowID,
+		"registered_at": r.startedAt,
+		"adapter_id":    adapterID,
+	}
+	if campaignID != "" {
+		agent["campaign_id"] = campaignID
+	}
+	if user := r.stringAttr(attrUserID); user != "" {
+		agent["user"] = user
+	}
+	return agent
 }

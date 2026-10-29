@@ -1,0 +1,3 @@
+# Collector binary built by `go build`
+flowceptcol
+flowceptcol.exe

@@ -19,7 +19,9 @@ buffer format, readable with `Flowcept.read_buffer_file()`.
 | parent span | `parent_task_id` |
 | span name | `activity_id` |
 | `openinference.span.kind` | `subtype` (lowercase) |
-| `agent.name` / `user.id` | `agent_id` / `user` |
+| `agent.name` | `agent_id = <agent.name>:<session.id>` (only `<agent.name>` without a session) |
+| `agent.name`, first time in a session | one `agent` record (`agent_id`, `name`, `campaign_id`, `workflow_id`, `registered_at`, `user`) |
+| `user.id` | `user` |
 | `input.value` / `output.value` | `used.input` / `generated.output` (JSON decoded when the mime type is `application/json`) |
 | start / end time | `started_at` / `ended_at` (epoch seconds) |
 | status `ERROR` | `status = ERROR`, otherwise `FINISHED` |
