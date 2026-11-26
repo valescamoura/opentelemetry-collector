@@ -28,8 +28,7 @@ type pendingTrace struct {
 // resolvedTrace remembers where a written trace went, so spans that arrive
 // after the root are written to the same workflow and campaign.
 type resolvedTrace struct {
-	workflowID string
-	campaignID string
+	info       traceInfo
 	resolvedAt time.Time
 }
 
@@ -107,7 +106,7 @@ func (e *flowceptExporter) pushTraces(_ context.Context, td ptrace.Traces) error
 			for k := 0; k < spans.Len(); k++ {
 				rec := newSpanRecord(spans.At(k), rs.Resource(), ss.Scope())
 				if done, ok := e.resolved[rec.traceID]; ok {
-					if err := e.writeTaskLocked(rec, done.workflowID, done.campaignID, e.nowSeconds()); err != nil {
+					if err := e.writeTaskLocked(rec, done.info, e.nowSeconds()); err != nil {
 						return err
 					}
 					continue
@@ -141,38 +140,48 @@ func (e *flowceptExporter) flushTraceLocked(traceID string) error {
 	}
 	delete(e.pending, traceID)
 
-	campaignID := sessionOf(p.spans)
-	workflowID := workflowIDFor(e.cfg.WorkflowIDPrefix, campaignID, traceID)
-	now := e.nowSeconds()
-
-	if campaignID != "" && !e.workflows[workflowID] {
-		if err := e.writeLocked(workflowRecord(workflowID, campaignID, e.cfg.AdapterID, now)); err != nil {
-			return err
-		}
-		e.workflows[workflowID] = true
+	session := sessionOf(p.spans)
+	info := traceInfo{
+		session:    session,
+		workflowID: workflowIDFor(e.cfg.WorkflowIDPrefix, session, traceID),
+		campaignID: campaignOf(e.cfg, p.spans, session),
+		taskIDs:    map[string]string{},
 	}
 	for _, rec := range p.spans {
-		if err := e.writeTaskLocked(rec, workflowID, campaignID, now); err != nil {
+		if id := taskIDFor(e.cfg, rec); id != rec.spanID {
+			info.taskIDs[rec.spanID] = id
+		}
+	}
+	now := e.nowSeconds()
+
+	if session != "" && !e.workflows[info.workflowID] {
+		if err := e.writeLocked(workflowRecord(e.cfg, p.spans, info, now)); err != nil {
+			return err
+		}
+		e.workflows[info.workflowID] = true
+	}
+	for _, rec := range p.spans {
+		if err := e.writeTaskLocked(rec, info, now); err != nil {
 			return err
 		}
 	}
-	e.resolved[traceID] = resolvedTrace{workflowID: workflowID, campaignID: campaignID, resolvedAt: e.now()}
+	e.resolved[traceID] = resolvedTrace{info: info, resolvedAt: e.now()}
 	return nil
 }
 
 // writeTaskLocked writes the task of a span, preceded by the record of its
 // agent the first time the agent shows up. Callers hold e.mu.
-func (e *flowceptExporter) writeTaskLocked(rec spanRecord, workflowID, campaignID string, now float64) error {
+func (e *flowceptExporter) writeTaskLocked(rec spanRecord, info traceInfo, now float64) error {
 	if agentName := rec.stringAttr(attrAgentName); agentName != "" {
-		agentID := agentIDFor(agentName, campaignID)
+		agentID := agentIDFor(agentName, info.session)
 		if !e.agents[agentID] {
-			if err := e.writeLocked(agentRecord(rec, workflowID, campaignID, e.cfg.AdapterID)); err != nil {
+			if err := e.writeLocked(agentRecord(e.cfg, rec, info)); err != nil {
 				return err
 			}
 			e.agents[agentID] = true
 		}
 	}
-	return e.writeLocked(taskRecord(rec, workflowID, campaignID, e.cfg.AdapterID, now))
+	return e.writeLocked(taskRecord(e.cfg, rec, info, now))
 }
 
 func (e *flowceptExporter) writeLocked(record map[string]any) error {

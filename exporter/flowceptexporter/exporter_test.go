@@ -44,7 +44,7 @@ type testSpan struct {
 func makeTraces(spans ...testSpan) ptrace.Traces {
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().PutStr("service.name", "workflow-gateway")
+	rs.Resource().Attributes().PutStr("service.name", "agent-app")
 	ss := rs.ScopeSpans().AppendEmpty()
 	ss.Scope().SetName("openinference.instrumentation.agno")
 	for _, s := range spans {
@@ -122,12 +122,12 @@ func TestChildrenAreHeldUntilRootAndInheritSession(t *testing.T) {
 	require.NoError(t, exp.pushTraces(ctx, makeTraces(child)))
 	assert.Empty(t, readRecords(t, path), "child must wait for its root")
 
-	root := testSpan{trace: traceA, id: rootA, name: "OmniAgent.run", attrs: map[string]string{
+	root := testSpan{trace: traceA, id: rootA, name: "PlannerAgent.run", attrs: map[string]string{
 		attrSpanKind:       "AGENT",
 		attrSessionID:      "sess-1",
-		attrAgentName:      "OmniAgent",
+		attrAgentName:      "PlannerAgent",
 		attrInputValue:     "Please create a workflow",
-		attrOutputValue:    `{"goal":"Download horizons"}`,
+		attrOutputValue:    `{"goal":"Download the dataset"}`,
 		attrOutputMimeType: mimeJSON,
 	}}
 	require.NoError(t, exp.pushTraces(ctx, makeTraces(root)))
@@ -142,12 +142,12 @@ func TestChildrenAreHeldUntilRootAndInheritSession(t *testing.T) {
 	assert.Equal(t, "chat:sess-1", rootTask["workflow_id"])
 	assert.Equal(t, "sess-1", rootTask["campaign_id"])
 	assert.Equal(t, "agent", rootTask["subtype"])
-	assert.Equal(t, "OmniAgent:sess-1", rootTask["agent_id"])
-	assert.Equal(t, "OmniAgent.run", rootTask["activity_id"])
+	assert.Equal(t, "PlannerAgent:sess-1", rootTask["agent_id"])
+	assert.Equal(t, "PlannerAgent.run", rootTask["activity_id"])
 	assert.Equal(t, "FINISHED", rootTask["status"])
 	assert.Nil(t, rootTask["parent_task_id"])
 	assert.Equal(t, map[string]any{"input": "Please create a workflow"}, rootTask["used"])
-	assert.Equal(t, map[string]any{"output": map[string]any{"goal": "Download horizons"}}, rootTask["generated"])
+	assert.Equal(t, map[string]any{"output": map[string]any{"goal": "Download the dataset"}}, rootTask["generated"])
 	assert.InDelta(t, 2.0, rootTask["ended_at"].(float64)-rootTask["started_at"].(float64), 1e-6)
 
 	childTask := tasks[childA.String()]
@@ -176,7 +176,7 @@ func TestAgentRecordIsWrittenOncePerSession(t *testing.T) {
 	exp, path := newTestExporter(t)
 	ctx := context.Background()
 	agentAttrs := func(session string) map[string]string {
-		return map[string]string{attrSessionID: session, attrAgentName: "OmniAgent", attrUserID: "valesca"}
+		return map[string]string{attrSessionID: session, attrAgentName: "PlannerAgent", attrUserID: "alice"}
 	}
 
 	require.NoError(t, exp.pushTraces(ctx, makeTraces(testSpan{trace: traceA, id: rootA, name: "turn 1", attrs: agentAttrs("sess-1")})))
@@ -193,16 +193,16 @@ func TestAgentRecordIsWrittenOncePerSession(t *testing.T) {
 		}
 	}
 	require.Len(t, agents, 2, "one agent record per (agent, session)")
-	assert.Equal(t, "OmniAgent:sess-1", agents[0]["agent_id"])
-	assert.Equal(t, "OmniAgent", agents[0]["name"])
+	assert.Equal(t, "PlannerAgent:sess-1", agents[0]["agent_id"])
+	assert.Equal(t, "PlannerAgent", agents[0]["name"])
 	assert.Equal(t, "sess-1", agents[0]["campaign_id"])
 	assert.Equal(t, "chat:sess-1", agents[0]["workflow_id"])
-	assert.Equal(t, "valesca", agents[0]["user"])
-	assert.Equal(t, "OmniAgent:sess-2", agents[1]["agent_id"])
+	assert.Equal(t, "alice", agents[0]["user"])
+	assert.Equal(t, "PlannerAgent:sess-2", agents[1]["agent_id"])
 
 	tasks := tasksByID(records)
-	assert.Equal(t, "OmniAgent:sess-1", tasks[rootB.String()]["agent_id"])
-	assert.Equal(t, "OmniAgent:sess-2", tasks[rootC.String()]["agent_id"])
+	assert.Equal(t, "PlannerAgent:sess-1", tasks[rootB.String()]["agent_id"])
+	assert.Equal(t, "PlannerAgent:sess-2", tasks[rootC.String()]["agent_id"])
 }
 
 func TestLateSpanFollowsResolvedTrace(t *testing.T) {
@@ -265,4 +265,112 @@ func TestFactoryCreatesTracesExporter(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, exp.Start(context.Background(), componenttest.NewNopHost()))
 	require.NoError(t, exp.Shutdown(context.Background()))
+}
+
+// mappingConfig uses every mapping option, as in the fuller example of the
+// README: campaign from metadata, one task per agent run keyed by its run id.
+func mappingConfig(cfg *Config) {
+	cfg.CampaignMetadataKey = "project_id"
+	cfg.MetadataNamespace = "app"
+	cfg.WorkflowSubtype = "conversation"
+	cfg.Subtypes = map[string]string{"root": "user_turn", "tool": "agent_tool"}
+	cfg.TaskIDs = map[string]TaskIDRule{"root": {Attribute: "agno.run.id", Prefix: "turn:"}}
+	cfg.IOKeys = map[string]IOKeys{"tool": {Input: "arguments", Output: "result"}}
+	cfg.MaxText = 12
+}
+
+func TestMappingRules(t *testing.T) {
+	exp, path := newTestExporter(t)
+	mappingConfig(exp.cfg)
+	ctx := context.Background()
+	meta := `{"v": 1, "project_id": "p1", "owner": "alice", "session_id": "sess-1", "mode": "chat"}`
+
+	// As in the agno instrumentation: the tool span ends (and is exported) before its agent run.
+	tool := testSpan{trace: traceA, id: childA, parent: rootA, name: "start_job", attrs: map[string]string{
+		attrSpanKind:       "TOOL",
+		attrSessionID:      "sess-1",
+		attrUserID:         "alice",
+		attrMetadata:       meta,
+		attrInputValue:     `{"tool": "resample", "arguments": "{\"path\": \"data/input.csv\"}"}`,
+		attrInputMimeType:  mimeJSON,
+		attrOutputValue:    "started job 42: resample",
+		attrOutputMimeType: "text/plain",
+	}}
+	root := testSpan{trace: traceA, id: rootA, name: "Assistant.arun", attrs: map[string]string{
+		attrSpanKind:       "AGENT",
+		attrAgentName:      "Assistant",
+		attrSessionID:      "sess-1",
+		attrUserID:         "alice",
+		attrMetadata:       meta,
+		"agno.run.id":      "r1",
+		attrInputValue:     "plot data",
+		attrOutputValue:    "started",
+		attrOutputMimeType: mimeJSON, // the agno instrumentation marks plain text as JSON
+	}}
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(tool)))
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(root)))
+	require.NoError(t, exp.shutdown(ctx))
+
+	records := readRecords(t, path)
+	var wf map[string]any
+	for _, r := range records {
+		if r["type"] == "workflow" {
+			wf = r
+		}
+	}
+	require.NotNil(t, wf)
+	assert.Equal(t, "chat:sess-1", wf["workflow_id"])
+	assert.Equal(t, "p1", wf["campaign_id"])
+	assert.Equal(t, "conversation", wf["subtype"])
+	assert.Equal(t, "alice", wf["user"])
+	assert.Equal(t, "p1", wf["custom_metadata"].(map[string]any)["app"].(map[string]any)["project_id"])
+
+	tasks := tasksByID(records)
+	require.Len(t, tasks, 2)
+	turn := tasks["turn:r1"]
+	require.NotNil(t, turn, "the root task id comes from agno.run.id")
+	assert.Equal(t, "user_turn", turn["subtype"])
+	assert.Equal(t, "p1", turn["campaign_id"])
+	assert.Equal(t, "Assistant:sess-1", turn["agent_id"])
+	assert.Equal(t, map[string]any{"input": "plot data"}, turn["used"])
+	assert.Equal(t, map[string]any{"output": "started"}, turn["generated"])
+	assert.Equal(t, "chat", turn["custom_metadata"].(map[string]any)["app"].(map[string]any)["mode"])
+
+	call := tasks[childA.String()]
+	require.NotNil(t, call)
+	assert.Equal(t, "agent_tool", call["subtype"])
+	assert.Equal(t, "start_job", call["activity_id"])
+	assert.Equal(t, "turn:r1", call["parent_task_id"], "children point to the renamed root")
+	assert.Equal(t, "p1", call["campaign_id"])
+	assert.Equal(t, "resample", call["used"].(map[string]any)["arguments"].(map[string]any)["tool"])
+	assert.Equal(t, "started job …", call["generated"].(map[string]any)["result"], "max_text truncates")
+	assert.Equal(t, "alice", call["custom_metadata"].(map[string]any)["app"].(map[string]any)["owner"])
+}
+
+func TestCampaignFromMetadataIsEmptyWithoutTheKey(t *testing.T) {
+	exp, path := newTestExporter(t)
+	mappingConfig(exp.cfg)
+	ctx := context.Background()
+	require.NoError(t, exp.pushTraces(ctx, makeTraces(testSpan{trace: traceA, id: rootA, name: "Assistant.arun",
+		attrs: map[string]string{attrSpanKind: "AGENT", attrSessionID: "sess-1"}})))
+	require.NoError(t, exp.shutdown(ctx))
+
+	records := readRecords(t, path)
+	assert.Equal(t, 1, countWorkflows(records), "the session still gets its workflow")
+	task := tasksByID(records)[rootA.String()]
+	require.NotNil(t, task, "without agno.run.id the task keeps the span id")
+	assert.Equal(t, "chat:sess-1", task["workflow_id"])
+	assert.Nil(t, task["campaign_id"], "no project, no campaign (the session is not used instead)")
+	assert.Equal(t, "user_turn", task["subtype"])
+}
+
+func TestConfigValidateRules(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	mappingConfig(cfg)
+	require.NoError(t, cfg.Validate())
+	cfg.MaxText = -1
+	require.Error(t, cfg.Validate())
+	cfg = createDefaultConfig().(*Config)
+	cfg.TaskIDs = map[string]TaskIDRule{"root": {Prefix: "turn:"}}
+	require.Error(t, cfg.Validate())
 }

@@ -1,6 +1,10 @@
-# Collector config for the workflow-gateway agent telemetry.
-# Run from the repository root:
-#   ./cmd/flowceptcol/flowceptcol --config cmd/flowceptcol/config.yaml
+# Example collector config with the Flowcept exporter.
+# Run from cmd/flowceptcol:
+#   ./flowceptcol --config config.yaml
+#
+# Applications send their OpenInference spans here (OTLP/gRPC on 4317, OTLP/HTTP on 4318); the flowcept
+# exporter appends Flowcept records to FLOWCEPT_OTEL_BUFFER_PATH. See exporter/flowceptexporter/README.md
+# for the mapping options (campaign from metadata, subtypes, task ids, io keys, max_text).
 receivers:
   otlp:
     protocols:
@@ -13,13 +17,30 @@ exporters:
   flowcept:
     # JSONL in the Flowcept offline buffer format (Flowcept.read_buffer_file).
     path: ${env:FLOWCEPT_OTEL_BUFFER_PATH:-flowcept_otel_buffer.jsonl}
-    # Workflow that groups all traces (chat turns) of one session: chat:<session.id>
-    workflow_id_prefix: "chat:"
+    # Workflow that groups all traces of one session: session:<session.id>
+    workflow_id_prefix: "session:"
     adapter_id: otel_openinference
     trace_timeout: 5m
+    # Optional mapping rules, e.g.:
+    # campaign_metadata_key: project_id   # campaign_id from using_attributes(metadata={"project_id": ...})
+    # metadata_namespace: app             # metadata copied to custom_metadata.app
+    # workflow_subtype: conversation
+    # subtypes: {root: user_turn, tool: agent_tool}
+    # task_ids: {root: {attribute: agno.run.id, prefix: "turn:"}}
+    # io_keys: {tool: {input: arguments, output: result}}
+    # max_text: 4096
+
+  # Optional copy to another OTLP backend (e.g. Phoenix): uncomment it and add it to the pipeline.
+  # otlphttp/copy:
+  #   endpoint: ${env:OTLP_COPY_ENDPOINT:-http://localhost:6006}
+
+processors:
+  batch: {}
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
+      processors: [batch]
       exporters: [flowcept]
+      # exporters: [flowcept, otlphttp/copy]

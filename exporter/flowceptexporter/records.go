@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -17,6 +18,7 @@ const (
 	attrSessionID      = "session.id"
 	attrUserID         = "user.id"
 	attrAgentName      = "agent.name"
+	attrMetadata       = "metadata"
 	attrSpanKind       = "openinference.span.kind"
 	attrInputValue     = "input.value"
 	attrInputMimeType  = "input.mime_type"
@@ -27,6 +29,12 @@ const (
 
 	statusFinished = "FINISHED"
 	statusError    = "ERROR"
+
+	// ruleRoot is the rule key of the root span of a trace.
+	ruleRoot = "root"
+
+	defaultInputKey  = "input"
+	defaultOutputKey = "output"
 )
 
 // spanRecord is a copy of the span data the exporter needs. Spans are copied
@@ -77,8 +85,38 @@ func (r spanRecord) stringAttr(key string) string {
 	return ""
 }
 
+// spanKind is the lowercase openinference.span.kind of the span.
+func (r spanRecord) spanKind() string {
+	return strings.ToLower(r.stringAttr(attrSpanKind))
+}
+
+// metadata decodes the OpenInference metadata attribute, a JSON object
+// serialized as a string. It is nil when absent or not an object.
+func (r spanRecord) metadata() map[string]any {
+	raw := r.stringAttr(attrMetadata)
+	if raw == "" {
+		return nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil
+	}
+	return decoded
+}
+
 func toEpochSeconds(ts pcommon.Timestamp) float64 {
 	return float64(ts.AsTime().UnixNano()) / float64(time.Second)
+}
+
+// ruleFor returns the rule of a span from rules keyed by "root" or span kind.
+func ruleFor[T any](rules map[string]T, r spanRecord) (T, bool) {
+	if r.isRoot() {
+		if v, ok := rules[ruleRoot]; ok {
+			return v, true
+		}
+	}
+	v, ok := rules[r.spanKind()]
+	return v, ok
 }
 
 // sessionOf returns the first session.id found among the spans of a trace.
@@ -87,6 +125,56 @@ func toEpochSeconds(ts pcommon.Timestamp) float64 {
 func sessionOf(spans []spanRecord) string {
 	for _, s := range spans {
 		if v := s.stringAttr(attrSessionID); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// firstOf returns the first non-empty string attribute among the spans,
+// trying the root span first.
+func firstOf(spans []spanRecord, key string) string {
+	for _, s := range spans {
+		if s.isRoot() {
+			if v := s.stringAttr(key); v != "" {
+				return v
+			}
+		}
+	}
+	for _, s := range spans {
+		if v := s.stringAttr(key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// metadataOf returns the OpenInference metadata of a trace, from its root
+// span if it has one, else from the first span that does.
+func metadataOf(spans []spanRecord) map[string]any {
+	for _, s := range spans {
+		if s.isRoot() {
+			if m := s.metadata(); m != nil {
+				return m
+			}
+		}
+	}
+	for _, s := range spans {
+		if m := s.metadata(); m != nil {
+			return m
+		}
+	}
+	return nil
+}
+
+// campaignOf returns the campaign_id of a trace: the session, or with
+// CampaignMetadataKey the value of that metadata key.
+func campaignOf(cfg *Config, spans []spanRecord, session string) string {
+	if cfg.CampaignMetadataKey == "" {
+		return session
+	}
+	for _, s := range spans {
+		if v, ok := s.metadata()[cfg.CampaignMetadataKey].(string); ok && v != "" {
 			return v
 		}
 	}
@@ -102,6 +190,17 @@ func workflowIDFor(prefix, session, traceID string) string {
 	return traceID
 }
 
+// taskIDFor builds the task_id of a span: by its TaskIDs rule when the span
+// has the rule's attribute, else its span id.
+func taskIDFor(cfg *Config, r spanRecord) string {
+	if rule, ok := ruleFor(cfg.TaskIDs, r); ok {
+		if v := r.stringAttr(rule.Attribute); v != "" {
+			return rule.Prefix + v
+		}
+	}
+	return r.spanID
+}
+
 // decodeValue parses JSON payloads so they are stored as objects instead of
 // escaped strings. Non-JSON values are kept as they are.
 func decodeValue(value, mimeType string) any {
@@ -115,42 +214,84 @@ func decodeValue(value, mimeType string) any {
 	return decoded
 }
 
+// truncate cuts a string value to max characters, marking the cut with "…".
+// Other values and max <= 0 leave the value as it is.
+func truncate(value any, max int) any {
+	s, ok := value.(string)
+	if !ok || max <= 0 || utf8.RuneCountInString(s) <= max {
+		return value
+	}
+	runes := []rune(s)
+	return string(runes[:max]) + "…"
+}
+
+// traceInfo is what all tasks of a trace share.
+type traceInfo struct {
+	session    string
+	workflowID string
+	campaignID string
+	// taskIDs maps the span ids of the trace whose task_id is not the span
+	// id (TaskIDs rules), so children point to the right parent task.
+	taskIDs map[string]string
+}
+
+func (t traceInfo) taskIDOf(spanID string) string {
+	if id, ok := t.taskIDs[spanID]; ok {
+		return id
+	}
+	return spanID
+}
+
 // taskRecord maps one span to a Flowcept task record.
-func taskRecord(r spanRecord, workflowID, campaignID, adapterID string, now float64) map[string]any {
+func taskRecord(cfg *Config, r spanRecord, t traceInfo, now float64) map[string]any {
 	task := map[string]any{
 		"type":          "task",
-		"task_id":       r.spanID,
-		"workflow_id":   workflowID,
+		"task_id":       taskIDFor(cfg, r),
+		"workflow_id":   t.workflowID,
 		"activity_id":   r.name,
 		"started_at":    r.startedAt,
 		"ended_at":      r.endedAt,
 		"utc_timestamp": now,
-		"adapter_id":    adapterID,
+		"adapter_id":    cfg.AdapterID,
 		"status":        statusFinished,
 	}
 	if r.statusCode == ptrace.StatusCodeError {
 		task["status"] = statusError
 	}
-	if campaignID != "" {
-		task["campaign_id"] = campaignID
+	if t.campaignID != "" {
+		task["campaign_id"] = t.campaignID
 	}
 	if r.parentSpanID != "" {
-		task["parent_task_id"] = r.parentSpanID
+		task["parent_task_id"] = t.taskIDOf(r.parentSpanID)
 	}
-	if kind := r.stringAttr(attrSpanKind); kind != "" {
-		task["subtype"] = strings.ToLower(kind)
+	if subtype, ok := ruleFor(cfg.Subtypes, r); ok {
+		task["subtype"] = subtype
+	} else if kind := r.spanKind(); kind != "" {
+		task["subtype"] = kind
 	}
 	if agent := r.stringAttr(attrAgentName); agent != "" {
-		task["agent_id"] = agentIDFor(agent, campaignID)
+		task["agent_id"] = agentIDFor(agent, t.session)
 	}
 	if user := r.stringAttr(attrUserID); user != "" {
 		task["user"] = user
 	}
+
+	keys := IOKeys{Input: defaultInputKey, Output: defaultOutputKey}
+	if custom, ok := ruleFor(cfg.IOKeys, r); ok {
+		if custom.Input != "" {
+			keys.Input = custom.Input
+		}
+		if custom.Output != "" {
+			keys.Output = custom.Output
+		}
+	}
 	if _, ok := r.attributes[attrInputValue]; ok {
-		task["used"] = map[string]any{"input": decodeValue(r.stringAttr(attrInputValue), r.stringAttr(attrInputMimeType))}
+		value := decodeValue(r.stringAttr(attrInputValue), r.stringAttr(attrInputMimeType))
+		task["used"] = map[string]any{keys.Input: truncate(value, cfg.MaxText)}
 	}
 	if _, ok := r.attributes[attrOutputValue]; ok {
-		task["generated"] = map[string]any{"output": decodeValue(r.stringAttr(attrOutputValue), r.stringAttr(attrOutputMimeType))}
+		value := decodeValue(r.stringAttr(attrOutputValue), r.stringAttr(attrOutputMimeType))
+		task["generated"] = map[string]any{keys.Output: truncate(value, cfg.MaxText)}
 	}
 
 	attributes := make(map[string]any, len(r.attributes))
@@ -171,20 +312,52 @@ func taskRecord(r spanRecord, workflowID, campaignID, adapterID string, now floa
 	if r.statusMessage != "" {
 		metadata["status_message"] = r.statusMessage
 	}
+	if cfg.MetadataNamespace != "" {
+		if m := r.metadata(); m != nil {
+			metadata[cfg.MetadataNamespace] = m
+		}
+	}
 	task["custom_metadata"] = metadata
 	return task
 }
 
 // workflowRecord builds the Flowcept workflow record of a session.
-func workflowRecord(workflowID, campaignID, adapterID string, now float64) map[string]any {
-	return map[string]any{
+func workflowRecord(cfg *Config, spans []spanRecord, t traceInfo, now float64) map[string]any {
+	wf := map[string]any{
 		"type":          "workflow",
-		"workflow_id":   workflowID,
-		"campaign_id":   campaignID,
-		"name":          workflowID,
-		"adapter_id":    adapterID,
+		"workflow_id":   t.workflowID,
+		"name":          t.workflowID,
+		"adapter_id":    cfg.AdapterID,
 		"utc_timestamp": now,
 	}
+	if t.campaignID != "" {
+		wf["campaign_id"] = t.campaignID
+	}
+	if cfg.WorkflowSubtype != "" {
+		wf["subtype"] = cfg.WorkflowSubtype
+	}
+	if user := firstOf(spans, attrUserID); user != "" {
+		wf["user"] = user
+	}
+	if cfg.MetadataNamespace != "" {
+		if m := metadataOf(spans); m != nil {
+			wf["custom_metadata"] = map[string]any{cfg.MetadataNamespace: m}
+		}
+	}
+	if started := earliestStart(spans); started > 0 {
+		wf["started_at"] = started
+	}
+	return wf
+}
+
+func earliestStart(spans []spanRecord) float64 {
+	var out float64
+	for _, s := range spans {
+		if s.startedAt > 0 && (out == 0 || s.startedAt < out) {
+			out = s.startedAt
+		}
+	}
+	return out
 }
 
 // agentIDFor builds the Flowcept agent_id of an agent in a session. A Flowcept
@@ -197,18 +370,18 @@ func agentIDFor(agentName, session string) string {
 }
 
 // agentRecord builds the Flowcept agent record of an agent in a session.
-func agentRecord(r spanRecord, workflowID, campaignID, adapterID string) map[string]any {
+func agentRecord(cfg *Config, r spanRecord, t traceInfo) map[string]any {
 	agentName := r.stringAttr(attrAgentName)
 	agent := map[string]any{
 		"type":          "agent",
-		"agent_id":      agentIDFor(agentName, campaignID),
+		"agent_id":      agentIDFor(agentName, t.session),
 		"name":          agentName,
-		"workflow_id":   workflowID,
+		"workflow_id":   t.workflowID,
 		"registered_at": r.startedAt,
-		"adapter_id":    adapterID,
+		"adapter_id":    cfg.AdapterID,
 	}
-	if campaignID != "" {
-		agent["campaign_id"] = campaignID
+	if t.campaignID != "" {
+		agent["campaign_id"] = t.campaignID
 	}
 	if user := r.stringAttr(attrUserID); user != "" {
 		agent["user"] = user
